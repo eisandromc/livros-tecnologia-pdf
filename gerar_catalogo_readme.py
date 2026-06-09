@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 import subprocess
+import unicodedata
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 import xml.etree.ElementTree as ET
 
 try:
@@ -16,6 +19,7 @@ except Exception:
 
 ARQUIVO_ATUAL = Path(__file__).name
 ARQUIVO_SAIDA = Path("README.md")
+ARQUIVO_INDICE = Path("conversao_indice.json")
 EXTENSOES_SUPORTADAS = {".pdf", ".epub", ".txt", ".ppt", ".pptx"}
 DIRETORIOS_IGNORADOS = {"__pycache__", ".git", "DUPLICADOS"}
 MARCADOR_INICIO = "<!-- catalogo-livros:inicio -->"
@@ -29,6 +33,7 @@ class RegistroLivro:
     ano: str
     autor: str
     caminho: Path
+    link_titulo: Optional[Path] = None
 
 
 def texto_limpo(valor: str | None) -> str:
@@ -56,6 +61,32 @@ def extrair_ano_texto(valor: str | None) -> str:
     texto = texto_limpo(valor)
     correspondencia = re.search(r"(19|20)\d{2}", texto)
     return correspondencia.group(0) if correspondencia else "Nao informado"
+
+
+def remover_acentos(texto: str) -> str:
+    normalizado = unicodedata.normalize("NFD", texto or "")
+    return "".join(caractere for caractere in normalizado if unicodedata.category(caractere) != "Mn")
+
+
+def normalizar_nome_arquivo_processado(nome_arquivo: str) -> str:
+    caminho = Path(nome_arquivo)
+    stem = remover_acentos(caminho.stem)
+    stem = re.sub(r"[^A-Za-z0-9\s\-|]+", " ", stem)
+    stem = re.sub(r"\s*\|\s*", " | ", stem)
+    stem = re.sub(r"\s*-\s*", "-", stem)
+    stem = re.sub(r"\s+", " ", stem).strip(" -|")
+
+    partes = []
+    for bloco in re.split(r"(\s+\|\s+|-|\s+)", stem):
+        if not bloco:
+            continue
+        if re.fullmatch(r"\s+\|\s+|-|\s+", bloco):
+            partes.append(bloco)
+            continue
+        partes.append(bloco[:1].upper() + bloco[1:].lower())
+
+    nome_limpo = "".join(partes).strip() or "Documento"
+    return f"{nome_limpo}{caminho.suffix.lower()}"
 
 
 def extrair_do_nome(caminho: Path) -> dict[str, str]:
@@ -135,6 +166,7 @@ def extrair_pdf(caminho: Path) -> dict[str, str]:
             }
         except Exception:
             dados = {}
+
     if not any(dados.values()):
         mdls = ler_mdls(caminho)
         dados = {
@@ -235,9 +267,6 @@ def extrair_frontmatter_markdown(texto: str) -> tuple[dict[str, str], str]:
         return {}, texto
 
     linhas = texto.splitlines()
-    if not linhas:
-        return {}, texto
-
     fim = None
     for indice in range(1, len(linhas)):
         if linhas[indice].strip() == "---":
@@ -257,17 +286,18 @@ def extrair_frontmatter_markdown(texto: str) -> tuple[dict[str, str], str]:
         if valor and not valor.startswith("-"):
             dados[chave] = valor
 
-    restante = "\n".join(linhas[fim + 1 :])
-    return dados, restante
+    return dados, "\n".join(linhas[fim + 1 :])
 
 
 def extrair_autor_markdown(corpo: str) -> str:
     for linha in corpo.splitlines():
         texto = linha.strip()
-        if not texto:
+        if not texto or texto.startswith("!["):
             continue
         if texto.startswith("# "):
-            return texto[2:].strip()
+            candidato = texto[2:].strip()
+            if len(candidato) >= 3:
+                return candidato
     return "Nao informado"
 
 
@@ -288,7 +318,80 @@ def extrair_markdown(caminho: Path) -> dict[str, str]:
     }
 
 
-def extrair_metadados_arquivo(caminho: Path) -> RegistroLivro:
+def carregar_mapeamento_markdown_para_original() -> tuple[dict[str, str], dict[str, str]]:
+    if not ARQUIVO_INDICE.exists():
+        return {}, {}
+
+    try:
+        indice = json.loads(ARQUIVO_INDICE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}, {}
+
+    por_markdown: dict[str, str] = {}
+    por_nome_base: dict[str, str] = {}
+    for chave in ("hashes", "livros", "assinaturas"):
+        bucket = indice.get(chave, {})
+        if not isinstance(bucket, dict):
+            continue
+        for registro in bucket.values():
+            if not isinstance(registro, dict):
+                continue
+            markdown = registro.get("markdown")
+            arquivo_original = registro.get("arquivo_original")
+            nome_base = registro.get("nome_base")
+            if markdown and arquivo_original:
+                por_markdown[str(Path(markdown).as_posix())] = str(arquivo_original)
+            if nome_base and arquivo_original:
+                por_nome_base[str(nome_base)] = str(arquivo_original)
+    return por_markdown, por_nome_base
+
+
+def construir_mapa_arquivos_disponiveis() -> dict[str, Path]:
+    mapa: dict[str, Path] = {}
+    diretorios = [Path("."), Path("ARQUIVOS_ORIGINAIS_PROCESSADOS"), Path("DUPLICADOS")]
+    for diretorio in diretorios:
+        if not diretorio.exists() or not diretorio.is_dir():
+            continue
+        for caminho in diretorio.iterdir():
+            if not caminho.is_file():
+                continue
+            mapa.setdefault(caminho.name.lower(), caminho)
+    return mapa
+
+
+def resolver_link_titulo(
+    caminho: Path,
+    por_markdown: dict[str, str],
+    por_nome_base: dict[str, str],
+    arquivos_disponiveis: dict[str, Path],
+) -> Optional[Path]:
+    if caminho.suffix.lower() == ".pdf":
+        return caminho
+
+    if caminho.suffix.lower() != ".md":
+        return caminho if caminho.exists() else None
+
+    relativo = caminho.as_posix()
+    nome_original = por_markdown.get(relativo) or por_nome_base.get(caminho.stem)
+    if not nome_original:
+        return None
+
+    candidatos = [nome_original]
+    candidatos.append(normalizar_nome_arquivo_processado(nome_original))
+
+    for candidato in candidatos:
+        encontrado = arquivos_disponiveis.get(candidato.lower())
+        if encontrado and encontrado.suffix.lower() == ".pdf":
+            return encontrado
+    return None
+
+
+def extrair_metadados_arquivo(
+    caminho: Path,
+    por_markdown: dict[str, str],
+    por_nome_base: dict[str, str],
+    arquivos_disponiveis: dict[str, Path],
+) -> RegistroLivro:
     base = extrair_do_nome(caminho)
     extratores = {
         ".pdf": extrair_pdf,
@@ -306,6 +409,7 @@ def extrair_metadados_arquivo(caminho: Path) -> RegistroLivro:
         ano=normalizar_campo(extras.get("ano") or base["ano"], "Nao informado"),
         autor=normalizar_campo(extras.get("autor") or base["autor"], "Nao informado"),
         caminho=caminho,
+        link_titulo=resolver_link_titulo(caminho, por_markdown, por_nome_base, arquivos_disponiveis),
     )
 
 
@@ -331,12 +435,19 @@ def localizar_outros_arquivos() -> list[Path]:
     for caminho in Path(".").iterdir():
         if not caminho.is_file():
             continue
-        if caminho.name in {ARQUIVO_SAIDA.name, ARQUIVO_ATUAL}:
+        if caminho.name in {ARQUIVO_SAIDA.name, ARQUIVO_ATUAL, ARQUIVO_INDICE.name}:
             continue
         if caminho.suffix.lower() not in EXTENSOES_SUPORTADAS:
             continue
         arquivos.append(caminho)
     return sorted(arquivos, key=lambda item: item.name.lower())
+
+
+def formatar_titulo(registro: RegistroLivro) -> str:
+    titulo = escapar_tabela(registro.titulo)
+    if registro.link_titulo is None:
+        return titulo
+    return f"[{titulo}]({registro.link_titulo.as_posix()})"
 
 
 def gerar_tabela(registros: list[RegistroLivro]) -> str:
@@ -348,16 +459,16 @@ def gerar_tabela(registros: list[RegistroLivro]) -> str:
         "| --- | --- | --- | --- | --- |",
     ]
     for registro in registros:
-        link = f"[{escapar_tabela(registro.caminho.name)}]({registro.caminho.as_posix()})"
+        link_arquivo = f"[{escapar_tabela(registro.caminho.name)}]({registro.caminho.as_posix()})"
         linhas.append(
             "| "
             + " | ".join(
                 [
-                    escapar_tabela(registro.titulo),
+                    formatar_titulo(registro),
                     escapar_tabela(registro.editora),
                     escapar_tabela(registro.ano),
                     escapar_tabela(registro.autor),
-                    link,
+                    link_arquivo,
                 ]
             )
             + " |"
@@ -400,19 +511,26 @@ def atualizar_readme(bloco_catalogo: str) -> None:
     ARQUIVO_SAIDA.write_text(novo_conteudo, encoding="utf-8")
 
 
-def criar_readme_de_markdowns() -> int:
-    arquivos = localizar_markdowns()
-    registros = [extrair_metadados_arquivo(caminho) for caminho in arquivos]
+def criar_registros(arquivos: list[Path]) -> list[RegistroLivro]:
+    por_markdown, por_nome_base = carregar_mapeamento_markdown_para_original()
+    arquivos_disponiveis = construir_mapa_arquivos_disponiveis()
+    registros = [
+        extrair_metadados_arquivo(caminho, por_markdown, por_nome_base, arquivos_disponiveis)
+        for caminho in arquivos
+    ]
     registros.sort(key=lambda item: item.titulo.lower())
+    return registros
+
+
+def criar_readme_de_markdowns() -> int:
+    registros = criar_registros(localizar_markdowns())
     atualizar_readme(montar_bloco_catalogo(registros, "Arquivos MD"))
     print(f"[*] README.md criado a partir de {len(registros)} arquivo(s) Markdown.")
     return len(registros)
 
 
 def criar_readme_de_outros_arquivos() -> int:
-    arquivos = localizar_outros_arquivos()
-    registros = [extrair_metadados_arquivo(caminho) for caminho in arquivos]
-    registros.sort(key=lambda item: item.titulo.lower())
+    registros = criar_registros(localizar_outros_arquivos())
     atualizar_readme(montar_bloco_catalogo(registros, "Outros arquivos"))
     print(f"[*] README.md criado a partir de {len(registros)} outro(s) arquivo(s).")
     return len(registros)
